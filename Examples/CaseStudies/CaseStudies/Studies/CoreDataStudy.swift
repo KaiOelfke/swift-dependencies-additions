@@ -7,6 +7,7 @@ import SwiftUINavigation
 final class CoreDataStudy: ObservableObject {
   enum Destination {
     case addSong(AddSongModel)
+    case editSong(AddSongModel)
   }
 
   @Dependency(\.persistentContainer) var persistentContainer
@@ -32,6 +33,7 @@ final class CoreDataStudy: ObservableObject {
           self.isLoadingComposers = true
           for try await composers in self.persistentContainer.request(
             Composer.self,
+            relationships: ["songs"],
             sortDescriptors: [
               NSSortDescriptor(keyPath: \Composer.songsCount, ascending: false),
               NSSortDescriptor(keyPath: \Composer.name, ascending: true),
@@ -58,6 +60,7 @@ final class CoreDataStudy: ObservableObject {
           self.isLoadingSongs = true
           for try await sectionedSongs in self.persistentContainer.request(
             Song.self,
+            relationships: ["composers"],
             sortDescriptors: [
               NSSortDescriptor(keyPath: \Song.year, ascending: true),
               NSSortDescriptor(keyPath: \Song.name, ascending: true),
@@ -90,6 +93,35 @@ final class CoreDataStudy: ObservableObject {
     }
   }
 
+  func composersForSong(song: Fetched<Song>) -> [Fetched<Composer>] {
+//    do {
+//      return try withDependencies(from: self) {
+//        try persistentContainer.withViewContext { viewContext in
+//          Array(song.composers as! Set<Composer>)
+//        }
+//      }
+//    } catch {
+//      logger.error("Failed to get composers of song: \(error)")
+//      return []
+//    }
+    song[keyPath: \.composerSet]
+  }
+
+  func songsForComposer(composer: Fetched<Composer>) -> [Fetched<Song>] {
+//    do {
+//      return try withDependencies(from: self) {
+//        try persistentContainer.withViewContext { viewContext in
+//          Array(composer.songs as! Set<Song>)
+//        }
+//      }
+//    } catch {
+//      logger.error("Failed to get songs of composer: \(error)")
+//      return []
+//    }
+
+    composer[keyPath: \.songSet]
+  }
+
   func userDidTapAddNewSongButton() {
     do {
       destination = try withDependencies(from: self) {
@@ -114,6 +146,27 @@ final class CoreDataStudy: ObservableObject {
     }
   }
 
+  func userDidTapSongRow(song: Fetched<Song>) {
+    do {
+      destination = try withDependencies(from: self) {
+        // We create a temporary `ViewContext` so:
+        // - We can drive the API with it
+        // - We can simply throw it away if the user doesn't effectively
+        // save the edited song.
+
+        Destination.editSong(
+          .init(
+            song: try persistentContainer.withNewChildViewContext { context in
+              context.object(with: song.objectID) as! Song
+            }
+          )
+        )
+      }
+    } catch {
+      logger.error("Failed to edit a song: \(error)")
+    }
+  }
+
   deinit {
     for task in tasks {
       task.cancel()
@@ -131,6 +184,12 @@ struct CoreDataStudyView: View {
             LabeledContent(composer.name ?? "") {
               Text("^[\(composer.songsCount) \("song")](inflect: true)")
             }
+            VStack(alignment: .leading) {
+              ForEach(model.songsForComposer(composer: composer)) { song in
+                Text(song.name ?? "")
+              }
+            }
+            .foregroundColor(.secondary)
           }
         }
       } header: {
@@ -144,11 +203,15 @@ struct CoreDataStudyView: View {
       ForEach(model.songsByYear) { songsByYear in
         Section {
           ForEach(songsByYear) { song in
-            VStack(alignment: .leading) {
-              Text(song.name ?? "")
-              Text(song.composersString)
-                .foregroundStyle(.secondary)
-                .font(.callout)
+            Button {
+              model.userDidTapSongRow(song: song)
+            } label: {
+              VStack(alignment: .leading) {
+                Text(song.name ?? "")
+                Text(song.composersString)
+                  .foregroundStyle(.secondary)
+                  .font(.callout)
+              }
             }
             .swipeActions {
               Button(role: .destructive) {
@@ -180,6 +243,14 @@ struct CoreDataStudyView: View {
         AddSongView(model: model)
       }
     }
+    .sheet(
+      unwrapping: $model.destination,
+      case: /CoreDataStudy.Destination.editSong
+    ) { $model in
+      NavigationStack {
+        AddSongView(model: model)
+      }
+    }
     .headerProminence(.increased)
     .navigationTitle("Core Data Study")
   }
@@ -191,7 +262,7 @@ final class AddSongModel: ObservableObject {
   @Dependency(\.logger["CoreDataStudy"]) var logger
 
   // In this example, we could use directly:
-  // @Dependency.Environment(\.dismiss) var dismiss
+  // @Dependency.Environment(\.dismxiss) var dismiss
   // but it is probably safer to namespace this dependency with an
   // `Hashable` identifier. We use here the static `id` property on
   // `ObservableObject` that ties this dependency to this model. We
@@ -201,6 +272,8 @@ final class AddSongModel: ObservableObject {
   // We need to use the same identifier on the view's side when calling:
   // .observeEnvironmentAsDependency(\.dismiss, id: AddSongModel)
   @Dependency.Environment(\.dismiss, id: AddSongModel.self) var dismiss
+  @Dependency(\.uuid) var uuid
+  @Dependency(\.persistentContainer) var persistenceContainer
 
   @Published var song: Fetched<Song>
 
@@ -221,9 +294,48 @@ final class AddSongModel: ObservableObject {
     do {
       try song.withManagedObjectContext {
         try $0.save()
+        // Need to save parent to update derive attributes, children context not enough?
+        try $0.parent?.save()
       }
     } catch {
       logger.error("Failed to save")
+    }
+  }
+
+  func userDidSwipeDeleteComposerRow(composer: Fetched<Composer>) {
+    composer.withManagedObject { composer in
+      song.withManagedObject { song in
+        composer.removeFromSongs(song)
+      }
+    }
+  }
+
+  func addComposerButtonTapped() {
+    // Method one
+//    song.withManagedObjectContext { context in
+//      song.withManagedObject { song in
+//        let composer = Composer(context: context)
+//        composer.identifier = uuid()
+//        composer.name = "New Composer"
+//        composer.addToSongs(song)
+//      }
+//    }
+
+    // Relationship changes aren't published?
+//    objectWillChange.send()
+
+    // Method two
+
+    do {
+      let composer: Fetched<Composer> = try song.withManagedObjectContext { context in
+        let composer = Composer(context: context)
+        composer.identifier = uuid()
+        composer.name = "New Composer"
+        return composer
+      }
+      song.editor.composerSet.append(composer)
+    } catch {
+      logger.error("Failed to add composer")
     }
   }
 }
@@ -232,10 +344,25 @@ struct AddSongView: View {
   @ObservedObject var model: AddSongModel
 
   var body: some View {
-    Form {
+    Self._printChanges()
+    return Form {
       TextField("Name", text: $model.song.editor.name.emptyIfNil())
       Stepper(value: $model.song.editor.year, in: 1960 ... 1970) {
         LabeledContent("Year", value: "\(model.song.year)")
+      }
+      ForEach($model.song.editor.composerSet) { $composer in
+        TextField("", text: $composer.editor.name.emptyIfNil())
+          .swipeActions {
+            Button(role: .destructive) {
+              model.userDidSwipeDeleteComposerRow(composer: composer)
+            } label: {
+              Label("Delete", systemImage: "trash")
+            }
+          }
+      }
+      // TODO: New composer vs selecting existing one.
+      Button("Add composer") {
+        self.model.addComposerButtonTapped()
       }
     }
     .toolbar {
@@ -370,5 +497,28 @@ extension Song {
       .map(\.name!)
       .sorted()
       .formatted(.list(type: .and))
+  }
+}
+
+//extension Fetched where ManagedObject == Song {
+//
+//
+//
+//  var composers: [Fetched<Composer>] {
+//
+//  }
+//}
+
+extension Song {
+  var composerSet: Set<Composer> {
+    get { composers as! Set<Composer> }
+    set { composers = newValue as NSSet }
+  }
+}
+
+extension Composer {
+  var songSet: Set<Song> {
+    get { songs as! Set<Song> }
+    set { songs = newValue as NSSet }
   }
 }

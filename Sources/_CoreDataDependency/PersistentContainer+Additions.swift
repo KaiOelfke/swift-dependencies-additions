@@ -22,6 +22,19 @@
 
     @_disfavoredOverload
     @MainActor
+    public func withViewContext<ManagedObject>(
+      perform: @MainActor (NSManagedObjectContext) throws -> [ManagedObject]
+    ) throws -> [Fetched<ManagedObject>] {
+      let context = self.viewContext
+      let objects = try perform(self.viewContext)
+      try context.obtainPermanentIDs(for: objects)
+      return objects.map {
+        Fetched(id: $0.objectID, context: context, viewContext: context)
+      }
+    }
+
+    @_disfavoredOverload
+    @MainActor
     public func withNewChildViewContext<ManagedObject>(
       perform: @MainActor (NSManagedObjectContext) throws -> ManagedObject
     ) throws -> Fetched<ManagedObject> {

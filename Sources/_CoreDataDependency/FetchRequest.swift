@@ -75,6 +75,21 @@
     public subscript<Value>(dynamicMember keyPath: KeyPath<ManagedObject, Value>) -> Value {
       (self.viewContext.object(with: self.id) as! ManagedObject)[keyPath: keyPath]
     }
+
+    @MainActor
+    public subscript<Value: NSManagedObject>(dynamicMember keyPath: KeyPath<ManagedObject, Value>) -> Fetched<Value> {
+      let toOneRelationship = (self.viewContext.object(with: self.id) as! ManagedObject)[keyPath: keyPath]
+      return Fetched<Value>(id: toOneRelationship.objectID, context: self.context, viewContext: self.viewContext)
+    }
+
+    @MainActor
+    public subscript<Value: NSManagedObject>(dynamicMember keyPath: KeyPath<ManagedObject, Set<Value>>) -> [Fetched<Value>] {
+      let toManyRelationship = (self.viewContext.object(with: self.id) as! ManagedObject)[keyPath: keyPath]
+      return toManyRelationship.map {
+        Fetched<Value>(id: $0.objectID, context: self.context, viewContext: self.viewContext)
+      }
+    }
+
   }
 
   extension Fetched {
@@ -121,6 +136,28 @@
         set {
           var object = (self.fetched.viewContext.object(with: self.fetched.id) as! ManagedObject)
           object[keyPath: keyPath] = newValue
+          self.fetched.token = .init()
+          self.fetched.viewContext.processPendingChanges()
+        }
+      }
+
+      @MainActor
+      public subscript<Value: NSManagedObject>(dynamicMember keyPath: WritableKeyPath<ManagedObject, Set<Value>>) -> [Fetched<Value>]
+      {
+        get {
+          let toManyRelationship = (self.fetched.viewContext.object(with: self.fetched.id) as! ManagedObject)[keyPath: keyPath]
+          return toManyRelationship.map {
+            Fetched<Value>(id: $0.objectID, context: self.fetched.context, viewContext: self.fetched.viewContext)
+          }
+        }
+        set {
+          var object = (self.fetched.viewContext.object(with: self.fetched.id) as! ManagedObject)
+          let rawValues = newValue.map {
+            $0.withManagedObject {
+              return $0
+            }
+          }
+          object[keyPath: keyPath] = Set(rawValues)
           self.fetched.token = .init()
           self.fetched.viewContext.processPendingChanges()
         }
@@ -214,6 +251,23 @@
       }
     }
 
+    @_disfavoredOverload
+    public func withManagedObjectContext<ManagedObject>(
+      perform: (NSManagedObjectContext) throws -> ManagedObject
+    ) throws -> Fetched<ManagedObject> {
+
+      var result: Swift.Result<Fetched<ManagedObject>, Error>?
+      self.context.performAndWait {
+        result = .init(catching: {
+          let context = self.viewContext
+          let object = try perform(self.viewContext)
+          try context.obtainPermanentIDs(for: [object])
+          return Fetched<ManagedObject>(id: object.objectID, context: context, viewContext: context)
+        })
+      }
+      return try result!.get()
+    }
+
     @discardableResult
     public func withManagedObjectContext<T>(perform: (NSManagedObjectContext) throws -> T) throws
       -> T
@@ -289,6 +343,7 @@
     public func callAsFunction<ManagedObject: NSManagedObject>(
       _ type: ManagedObject.Type,
       predicate: NSPredicate? = nil,
+      relationships: [String] = [],
       sortDescriptors: [NSSortDescriptor] = [],
       context: NSManagedObjectContext? = nil
     ) -> AsyncThrowingStream<Results<ManagedObject>, Error> {
@@ -296,6 +351,9 @@
       let fetchRequest = NSFetchRequest<ManagedObject>(
         entityName: String(describing: ManagedObject.self))
       fetchRequest.predicate = predicate
+      if !relationships.isEmpty {
+        fetchRequest.relationshipKeyPathsForPrefetching = relationships
+      }
       fetchRequest.sortDescriptors = sortDescriptors
       if fetchRequest.sortDescriptors!.isEmpty {
         fetchRequest.sortDescriptors?.append(
@@ -313,6 +371,7 @@
     public func callAsFunction<SectionIdentifier: Hashable, ManagedObject: NSManagedObject>(
       _ type: ManagedObject.Type,
       predicate: NSPredicate? = nil,
+      relationships: [String] = [],
       sortDescriptors: [NSSortDescriptor] = [],
       sectionIdentifier: KeyPath<ManagedObject, SectionIdentifier>,
       context: NSManagedObjectContext? = nil
@@ -322,6 +381,10 @@
         entityName: String(describing: ManagedObject.self))
       fetchRequest.predicate = predicate
       fetchRequest.sortDescriptors = sortDescriptors
+
+      if !relationships.isEmpty {
+        fetchRequest.relationshipKeyPathsForPrefetching = relationships
+      }
 
       if fetchRequest.sortDescriptors!.first?.keyPath != sectionIdentifier {
         fetchRequest.sortDescriptors?.insert(
